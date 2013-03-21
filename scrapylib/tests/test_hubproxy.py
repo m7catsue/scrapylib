@@ -25,10 +25,14 @@ class HubProxyMiddlewareTestCase(TestCase):
         crawler.engine = MockedEngine()
         return crawler
 
-    def _assert_disabled(self, spider, settings=None):
+    def _get_middleware(self, spider, settings=None):
         crawler = self._mock_crawler(settings)
         mw = self.mwcls.from_crawler(crawler)
         mw.open_spider(spider)
+        return crawler, mw
+
+    def _assert_disabled(self, spider, settings=None):
+        crawler, mw = self._get_middleware(spider, settings)
         req = Request('http://www.scrapytest.org')
         out = mw.process_request(req, spider)
         self.assertEqual(out, None)
@@ -39,7 +43,7 @@ class HubProxyMiddlewareTestCase(TestCase):
         assert mw.process_response(req, res, spider) is res
         res = Response(req.url, status=mw.ban_code)
         assert mw.process_response(req, res, spider) is res
-        assert mw._bans == 0 
+        assert mw._bans == 0
 
     def _assert_enabled(self, spider,
                         settings=None,
@@ -49,9 +53,7 @@ class HubProxyMiddlewareTestCase(TestCase):
                         maxbans=20,
                         download_timeout=1800,
                        ):
-        crawler = self._mock_crawler(settings)
-        mw = self.mwcls.from_crawler(crawler)
-        mw.open_spider(spider)
+        crawler, mw = self._get_middleware(spider, settings)
         req = Request('http://www.scrapytest.org')
         assert mw.process_request(req, spider) is None
         self.assertEqual(req.meta.get('proxy'), proxyurl)
@@ -70,6 +72,8 @@ class HubProxyMiddlewareTestCase(TestCase):
         res = Response(req.url)
         assert mw.process_response(req, res, spider) is res
 
+        req = Request('http://www.scrapytest.org')
+        assert mw.process_request(req, spider) is None
         if maxbans > 0:
             # assert ban count is reseted after a succesful response
             res = Response('http://ban.me', status=bancode)
@@ -87,6 +91,26 @@ class HubProxyMiddlewareTestCase(TestCase):
 
         # max bans reached and close_spider called
         self.assertEqual(crawler.engine.fake_spider_closed_result, (spider, 'banned'))
+
+    def _assert_allowed(self, spider, settings=None):
+        crawler, mw = self._get_middleware(spider, settings)
+        onsite_reqs = [
+                Request('http://scrapytest.org/1'),
+                Request('http://scrapy.org/1'),
+                Request('http://sub.scrapy.org/1'),
+                Request('http://offsite.tld/letmepass', dont_filter=True)]
+        offsite_reqs = [
+                Request('http://scrapy2.org'),
+                Request('http://offsite.tld/'),
+                Request('http://scrapytest.org/1', meta={'dont_proxy':True})]
+        reqs = onsite_reqs + offsite_reqs
+
+        for req in reqs:
+            mw.process_request(req, self.spider)
+            if req in onsite_reqs:
+                self.assertIn('proxy', req.meta)
+            elif req in offsite_reqs:
+                self.assertNotIn('proxy', req.meta)
 
     def test_disabled_by_lack_of_hubproxy_settings(self):
         self._assert_disabled(self.spider, settings={})
@@ -134,6 +158,17 @@ class HubProxyMiddlewareTestCase(TestCase):
         self._assert_enabled(self.spider, self.settings, download_timeout=60)
         self.spider.hubproxy_download_timeout = 120
         self._assert_enabled(self.spider, self.settings, download_timeout=120)
+
+    def test_allowed_domains_in_settings(self):
+        self._assert_allowed(self.spider, {
+            'HUBPROXY_ENABLED':True,
+            'HUBPROXY_ALLOWED_DOMAINS': ['scrapytest.org', 'scrapy.org'],
+            })
+
+    def test_allowed_domains_in_spider_attribute(self):
+        self.spider.use_hubproxy = True
+        self.spider.hubproxy_allowed_domains = ['scrapytest.org', 'scrapy.org']
+        self._assert_allowed(self.spider)
 
     def test_hooks(self):
         class _ECLS(self.mwcls):
