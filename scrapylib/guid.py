@@ -10,6 +10,8 @@ def hash_values(*values):
     For example:
     >>> hash_values('some', 'values', 'to', 'hash')
     '1d7b7a17aeb0e5f9a6814289d12d3253'
+    >>> hash_values('A') != hash_values('a')
+    True
     """
     hash = hashlib.md5()
     for value in values:
@@ -23,6 +25,7 @@ def hash_values(*values):
 class GUIDPipeline(object):
 
     item_fields = {}
+    item_preprocessors = {}
 
     def __init__(self):
         self.guids = {}
@@ -53,10 +56,13 @@ class GUIDPipeline(object):
 
     def generate_guid(self, item, spider):
         values = []
-        for field in  self.item_fields[type(item)]:
+        for field in self.item_fields[type(item)]:
             value = item.get(field)
             if value is None:
                 return
+            pre_func = self.item_preprocessors.get(field)
+            if pre_func:
+                value = pre_func(value)
             values.append(value.encode('utf-8'))
         values.insert(0, spider.name)
         return hash_values(*values)
