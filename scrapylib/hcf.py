@@ -65,6 +65,7 @@ spider slot_callback method to a function with the following signature:
        return slot
 
 """
+import time
 import hashlib, os
 from collections import defaultdict
 from datetime import datetime
@@ -80,39 +81,78 @@ from threading import Thread, Event
 from Queue import Queue, Empty
 
 
+class BaseRequestEncoder(object):
+
+    def encode(self, request):
+        """Returns string object representing the request"""
+        raise NotImplementedError
+
+    def decode(self, request):
+        """Returns scrapy.http.Request object from a string"""
+        raise NotImplementedError
+
+
+class JsonRequestEncoder(BaseRequestEncoder):
+
+    def __init__(self, spider):
+        self.spider = spider
+
+    def encode(self, request):
+        return json.dumps(request_to_dict(request, self.spider))
+
+    def decode(self, request):
+        return request_from_dict(json.loads(request), self.spider)
+
+
 class BaseQueue(object):
     """Queue Interface for Middleware"""
+
+    def __init__(self, settings, spider):
+        pass
 
     def task_done(self):
         """Should return None, is just to notify the Queue a
         batch had been processed"""
-        pass
+        raise NotImplementedError
 
     def get(self):
         """It should return an iterable of requests"""
-        pass
+        raise NotImplementedError
 
     def put(self, request):
         """It recieve a request and returns None"""
-        pass
+        raise NotImplementedError
+
+    def flush(self):
+        """Returns None. Blocking call that force to upload
+        requests on the queue"""
+        raise NotImplementedError
 
     def close(self):
-        """Returns None just to do closing stuff like flush data"""
-        pass
+        """Returns None, just to do closing stuff like flush data"""
+        raise NotImplementedError
+
+    def delete(self):
+        """Returns None. Blocking call that reset the queue"""
+        raise NotImplementedError
 
 
 class FrontierQueue(BaseQueue):
 
     def __init__(self, settings, spider):
-        client, frontier, slot, maxsize = self._get_settings(settings, spider)
+        endpoint, auth, project_id, frontier, slots, maxsize = \
+                self._get_settings(settings, spider)
 
-        self.spider = spider
-        self.client = client
+        self.encoder = JsonRequestEncoder(spider)
+        self.hubstorage = HubstorageClient(auth=auth, endpoint=endpoint)
+        self.project = self.hubstorage.get_project(project_id)
+        self.client = self._get_client(settings, spider)
         self.frontier = frontier
-        self.slot = slot
+        self.all_slots = deque(range(slots))
+        self.read_slot = self._get_read_slot(spider)
         self.batch_ids = deque()
-        self.already_seen = set()
-        self.counter = {'in':0,'out':0}
+        self.all_slots.rotate(-self.read_slot)
+        self.counter = 0
 
         self.queue = Queue(maxsize=maxsize)
         self._start_download = Event()
@@ -122,28 +162,56 @@ class FrontierQueue(BaseQueue):
 
     def _get_settings(self, settings, spider):
         endpoint = settings.get('HS_ENDPOINT')
-        auth = settings.get('HS_AUTH', settings.get('SH_APIKEY'))
-        self.hubstorage = HubstorageClient(auth=auth, endpoint=endpoint)
+        auth = settings.get('HS_AUTH')
         project_id = settings.get('HS_FRONTIER_PROJECTID',
                 os.environ.get('SCRAPY_PROJECT_ID'))
-        project = self.hubstorage.get_project(project_id)
-        client = project.frontier
         maxsize = 2
-        frontier = getattr(spider, 'hs_frontier', settings.get('HS_FRONTIER'))
-        slot = getattr(spider, 'hs_slot', settings.get('HS_SLOT'))
-        return client, frontier, slot, maxsize
+        frontier = getattr(spider, 'hs_frontier',
+                settings.get('HS_FRONTIER', spider.name))
+        slots = getattr(spider, 'hs_totalslots',
+                settings.getint('HS_TOTALSLOTS', 1))
+        return endpoint, auth, project_id, frontier, slots, maxsize
+
+    def _get_client(self, settings, spider):
+        client = self.project.frontier
+        client.batch_size = 100
+        return client
+
+    def _get_read_slot(self, spider):
+        project = self.project
+        spider_id = project.ids.spider(spider.name)
+        job_key = os.environ.get('SCRAPY_JOB')
+        slot = None
+        while slot is None:
+            jobq = project.jobq.summary('running', spider_id)
+            slots = []
+            for summary in jobq['summary']:
+                if summary['key'] == job_key:
+                    continue
+                tag = None
+                for tag in summary['tags']:
+                    if tag.startswith('slot='):
+                        slots.append(tag.replace('slot=', ''))
+                if not tag:
+                    break
+            else:
+                slot = deque(x for x in self.all_slots
+                        if x not in slots).popleft()
+        if job_key:
+            jobmeta = project.get_job(job_key).jobmetadata
+            jobmeta['tags'].append('slot={}'.format(slot))
+            jobmeta.save()
+        return slot
 
     def _download_batches(self):
         self._start_download.wait()
         while True:
-            for batch in self.client.read(self.frontier, self.slot, mincount=1000):
-                print "requests downloaded"
+            for batch in self.client.read(self.frontier, self.read_slot, mincount=400):
                 self.queue.put(batch, block=True)
             self.queue.join()
 
     def task_done(self):
-        self.client.delete(self.frontier, self.slot, self.batch_ids.popleft())
-        self.client.flush()
+        self.client.delete(self.frontier, self.read_slot, self.batch_ids.popleft())
         self.queue.task_done()
 
     def get(self):
@@ -151,34 +219,30 @@ class FrontierQueue(BaseQueue):
         try:
             batch = self.queue.get(timeout=3.0)
         except Empty:
-            print "w8ing for flush"
-            writer = self.client._get_writer(self.frontier, self.slot)
-            writer._waitforq()
+            self.flush()
             batch = self.queue.get(timeout=3.0)
         self.batch_ids.append(batch['id'])
-        return (deserializer(request, self.spider) for _, request in batch['requests'])
+        decode = self.encoder.decode
+        return (decode(request) for _, request in batch['requests'])
 
     def put(self, request):
-        fp = request_fingerprint(request)
-        if fp in self.already_seen:
-            return
-        self.counter['in'] += 1
-        self.already_seen.add(fp)
-        request = {'fp': fp, 'qdata': serializer(request, self.spider)}
-        self.client.add(self.frontier, self.slot, [request])
+        request = {'fp': request_fingerprint(request),
+                   'qdata': self.encoder.encode(request)}
+        self.client.add(self.frontier, self.all_slots[0], [request])
+        self.counter += 1
+        if self.counter % 100 == 0:
+            self.all_slots.rotate(-1)
+
+    def flush(self):
+        self.client.flush()
 
     def close(self):
-        print self.counter
         self.client.close()
         self.hubstorage.close()
 
-
-def deserializer(request, spider):
-    return request_from_dict(request, spider)
-
-
-def serializer(request, spider):
-    return request_to_dict(request, spider)
+    def delete(self):
+        for slot in self.all_slots:
+            self.client.delete_slot(self.frontier, slot)
 
 
 import json
@@ -267,18 +331,12 @@ class SQSQueue(BaseQueue):
         try:
             message = self.queue.get(timeout=3.0)
         except Empty:
-            print "w8ing for flush"
             self.flush()
             message = self.queue.get(timeout=3.0)
         self.batch_ids.append(message.receipt_handle)
-        return (deserializer(request, self.spider) for request in json.loads(message.get_body()))
+        return json.loads(message.get_body())
 
     def put(self, request):
-        fp = request_fingerprint(request)
-        if fp in self.already_seen:
-            return
-        self.already_seen.add(fp)
-        request = serializer(request, self.spider)
         self.qup.put(request, block=True)
         self.counter += 1
         if self.counter >= BATCHSIZE:
@@ -296,26 +354,32 @@ class SQSQueue(BaseQueue):
         self._upload_batch.set()
 
 
-class HcfMiddleware(object):
+class ExternalRequestTrackingMiddleware(object):
+
+    def __init__(self, settings):
+        self.debug = settings.getbool('ERT_DEBUG')
+        if settings.getbool('ERT_FILTER_DUPLICATES'):
+            self.already_seen = []
 
     @classmethod
     def from_crawler(cls, crawler):
-        if not crawler.settings.getbool('HS_FRONTIER_ENABLED'):
-            raise NotConfigured()
-        o = cls()
+        if not crawler.settings.getbool('ERT_ENABLED'):
+            raise NotConfigured
+        o = cls(crawler.settings)
         o.crawler = crawler
+        o.task_scheduled = False
         crawler.signals.connect(o.spider_idle, signal=signals.spider_idle)
+        crawler.signals.connect(o.engine_stopped, signal=signals.engine_stopped)
         return o
 
     def _get_queue(self, spider):
         settings = spider.settings
-        return SQSQueue(settings, spider)
+        return FrontierQueue(settings, spider)
 
     def process_start_requests(self, start_requests, spider):
-        print "START"
         self.queue = self._get_queue(spider)
-        self.flag = False
-        if getattr(spider, 'use_start_requests', False):
+        if getattr(spider, 'ert_start', False):
+            self.queue.delete()
             for request in start_requests:
                 yield request
         else:
@@ -323,38 +387,45 @@ class HcfMiddleware(object):
                 yield request
 
     def _get_requests(self):
+        start = time.time()
         try:
-            for request in self.queue.get():
+            for idx, request in enumerate(self.queue.get(), start=1):
                 yield request
         except Empty:
-            pass
+            return
+        self.task_scheduled = True
+        if self.debug:
+            log.msg('Got {} requests in {} seconds'.format(idx,
+                time.time() - start), level=log.INFO)
 
     def spider_idle(self, spider):
-        print "idle"
-        if hasattr(self, 'queue'):
-            if self.flag:
-                self.queue.task_done()
-            self.flag = True
-            request = None
-            for request in self._get_requests():
-                self.crawler.engine.crawl(request, spider)
-            print request
-            if request:
-                raise DontCloseSpider
-            else:
-                print "Queue closed"
-                self.queue.close()
+        if self.task_scheduled:
+            self.queue.task_done()
+            self.task_scheduled = False
+        request = None
+        for request in self._get_requests():
+            self.crawler.engine.crawl(request, spider)
+        if request:
+            raise DontCloseSpider
 
     def _process_spider_request(self, response, request, spider):
-        if 'dont_hcf' in request.meta:
-            return
+        if 'dont_ert' in request.meta:
+            return request
+
+        if hasattr(self, 'already_seen'):
+            fp = request_fingerprint(request)
+            if fp in self.already_seen:
+                return
+            self.already_seen.append(fp)
 
         self.queue.put(request)
 
     def process_spider_output(self, response, result, spider):
-        results = result
-        for result in results:
-            if isinstance(result, Request):
-                self._process_spider_request(response, result, spider)
+        for x in result:
+            if isinstance(x, Request):
+                yield self._process_spider_request(response, x, spider)
             else:
-                yield result
+                yield x
+
+    def engine_stopped(self):
+        self.queue.close()
